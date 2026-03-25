@@ -37,3 +37,21 @@ This project addresses the growing issue of document forgery by using **Machine 
 │   └── app.py           # Application entry point
 ├── requirements.txt     # Project dependencies
 └── README.md            # Project documentation
+
+⚙️ Installation & Usage
+Clone the repo:
+
+Bash
+git clone [https://github.com/BOYACHIRAPPAGARISAIHARIKA/Fake-Certificate-Verification.git](https://github.com/BOYACHIRAPPAGARISAIHARIKA/Fake-Certificate-Verification.git)
+Install requirements:
+
+Bash
+pip install -r requirements.txt
+Run the verification:
+
+Bash
+python src/app.py
+📝 Author
+Boya Chirrappagari Sai Harika B.Tech - Artificial Intelligence and Data Science
+
+
