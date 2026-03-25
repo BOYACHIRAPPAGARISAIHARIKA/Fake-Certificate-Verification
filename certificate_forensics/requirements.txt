@@ -1,0 +1,17 @@
+# Image Processing
+opencv-python
+Pillow
+
+# Data Science & Machine Learning
+numpy
+pandas
+scikit-learn
+matplotlib
+seaborn
+
+# Optional: Web Interface (if you plan to use them)
+# streamlit 
+# flask
+
+# Development utilities
+joblib
