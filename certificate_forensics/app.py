@@ -9,7 +9,6 @@ import logging
 import plotly.figure_factory as ff
 import pytesseract
 import cv2
-import zipfile
 from io import BytesIO
 from PIL import Image, ImageChops, ImageEnhance, ExifTags
 from reportlab.pdfgen import canvas
@@ -222,95 +221,6 @@ def show_dashboard():
     st.table(logs)
     conn.close()
 
-def show_bulk_auditor(ela_sensitivity):
-    st.markdown("## 📂 Bulk Forensic Auditor")
-    st.info("Upload multiple documents to perform batch forensic analysis and generate a master ZIP of all reports.")
-
-    up_files = st.file_uploader("Upload Documents", type=["jpg", "png", "jpeg"], accept_multiple_files=True)
-
-    if up_files:
-        bulk_results = []
-        pdf_reports = [] 
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        for idx, up_file in enumerate(up_files):
-            status_text.text(f"Processing {idx+1}/{len(up_files)}: {up_file.name}")
-            
-            f_bytes = up_file.read()
-            img = Image.open(BytesIO(f_bytes))
-            
-            owner = verify_document(f_bytes)
-            
-            ela_img = perform_ela(img, enhancement=ela_sensitivity)
-            score, mean_n, std_n, kurt_n = analyze_noise_distribution(ela_img)
-            
-            ela_buf = BytesIO()
-            ela_img.save(ela_buf, format="PNG")
-            ela_img_bytes = ela_buf.getvalue()
-            
-            text_on_doc = extract_text_from_image(img)
-            match_status, text_score = cross_reference_text(text_on_doc, owner)
-            exif = img.getexif()
-            software = exif.get(305) or exif.get(0x0131)
-            meta_findings = [f"Software: {software}"] if software else ["Metadata: Clean"]
-
-            try:
-                pdf_data = generate_forensic_report(
-                    filename=up_file.name,
-                    owner=owner if owner else "Unregistered",
-                    score=score,
-                    metadata=meta_findings,
-                    ela_img_bytes=ela_img_bytes,
-                    orig_img_bytes=f_bytes
-                )
-                pdf_reports.append((up_file.name, pdf_data))
-            except Exception as e:
-                st.error(f"Error generating report for {up_file.name}: {e}")
-
-            bulk_results.append({
-                "Filename": up_file.name,
-                "Auth Index": f"{score}%",
-                "Text Match": "✅" if text_score == 100 else "❌",
-                "Status": "PASS" if score > 85 else "INVESTIGATE"
-            })
-            
-            progress_bar.progress((idx + 1) / len(up_files))
-
-        status_text.success(f"✅ Batch Complete: {len(up_files)} Forensic Reports Ready.")
-        
-        st.subheader("Audit Overview")
-        df = pd.DataFrame(bulk_results)
-        st.dataframe(df, use_container_width=True)
-
-        zip_buffer = BytesIO()
-        with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
-            for filename, data in pdf_reports:
-                zip_file.writestr(f"Report_{filename}.pdf", data)
-        
-        st.divider()
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.download_button(
-                label="📥 Download All PDF Reports (ZIP)",
-                data=zip_buffer.getvalue(),
-                file_name=f"Forensic_Batch_{datetime.datetime.now().strftime('%Y%m%d')}.zip",
-                mime="application/zip",
-                use_container_width=True,
-                type="primary"
-            )
-            
-        with col2:
-            csv = df.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                "📊 Download Summary CSV",
-                csv,
-                "audit_summary.csv",
-                "text/csv",
-                use_container_width=True
-            )
-
 # --- 8. MAIN APPLICATION ---
 
 def main():
@@ -325,18 +235,23 @@ def main():
         up_file = st.file_uploader("Upload Document (High-Res)", type=["jpg", "png", "jpeg"])
         
         if up_file:
+            # Initialize session state
             if 'current_file' not in st.session_state:
                 st.session_state.current_file = None
             if 'results' not in st.session_state:
                 st.session_state.results = {}
             
+            # Reset if new file
             if st.session_state.current_file != up_file.name:
                 st.session_state.current_file = up_file.name
                 st.session_state.results = {}
             
+            # --- STEP 1: FILE LOADING ---
             st.subheader("📤 Step 1: Document Upload")
             with st.expander("File Information", expanded=True):
                 st.write(f"**Filename:** {up_file.name}")
+                st.write(f"**File Size:** {len(up_file.getvalue()) / 1024:.2f} KB")
+                
                 if 'img_bytes' not in st.session_state.results:
                     f_bytes = up_file.read()
                     img = Image.open(BytesIO(f_bytes))
@@ -345,148 +260,171 @@ def main():
                 else:
                     f_bytes = st.session_state.results['img_bytes']
                     img = st.session_state.results['img']
+                
                 st.image(img, caption="Uploaded Document", use_container_width=True)
             
+            # --- STEP 2: IDENTITY VERIFICATION ---
             st.subheader("🔍 Step 2: Identity Verification")
             with st.expander("Blockchain Hash Verification", expanded=True):
                 if 'owner' not in st.session_state.results:
-                    owner = verify_document(f_bytes)
-                    st.session_state.results['owner'] = owner
+                    with st.spinner("Computing SHA-256 Hash..."):
+                        owner = verify_document(f_bytes)
+                        st.session_state.results['owner'] = owner
                 else:
                     owner = st.session_state.results['owner']
                 
                 if owner:
                     st.success(f"✅ Verified Owner: {owner}")
+                    log_event(f"Document verified - Owner: {owner}")
                 else:
-                    st.error("⚠️ No Registry Record Found")
+                    st.error("⚠️ No Registry Record Found - Document is UNREGISTERED")
+                    log_event("Unregistered document analyzed")
             
+            # --- STEP 3: ELA ANALYSIS ---
             st.subheader("⚡ Step 3: Error Level Analysis")
             with st.expander("Compression Error Detection", expanded=True):
                 if 'ela_img' not in st.session_state.results:
-                    ela_img = perform_ela(img, enhancement=ela_sensitivity)
-                    st.session_state.results['ela_img'] = ela_img
+                    with st.spinner("Performing ELA Analysis..."):
+                        ela_img = perform_ela(img, enhancement=ela_sensitivity)
+                        st.session_state.results['ela_img'] = ela_img
                 else:
                     ela_img = st.session_state.results['ela_img']
                 
+                st.write("**Quantization Error Map:**")
                 fig, ax = plt.subplots(figsize=(10, 6))
-                ax.imshow(np.array(ela_img.convert('L')), cmap='magma')
+                im = ax.imshow(np.array(ela_img.convert('L')), cmap='magma')
+                plt.colorbar(im, label="Compression Error Density")
                 ax.axis('off')
                 st.pyplot(fig)
                 plt.close(fig)
-
+            
+            # --- STEP 4: FORENSIC METRICS ---
             st.subheader("📊 Step 4: Forensic Metrics")
             with st.expander("Statistical Analysis", expanded=True):
                 if 'metrics' not in st.session_state.results:
-                    score, mean_n, std_n, kurt_n = analyze_noise_distribution(ela_img)
-                    st.session_state.results['metrics'] = {'score': score, 'mean': mean_n, 'std': std_n, 'kurtosis': kurt_n}
+                    with st.spinner("Computing Statistical Metrics..."):
+                        score, mean_n, std_n, kurt_n = analyze_noise_distribution(ela_img)
+                        st.session_state.results['metrics'] = {
+                            'score': score, 'mean': mean_n, 'std': std_n, 'kurtosis': kurt_n
+                        }
                 else:
-                    m = st.session_state.results['metrics']
-                    score, mean_n, std_n, kurt_n = m['score'], m['mean'], m['std'], m['kurtosis']
+                    metrics = st.session_state.results['metrics']
+                    score = metrics['score']
+                    mean_n = metrics['mean']
+                    std_n = metrics['std']
+                    kurt_n = metrics['kurtosis']
                 
                 c1, c2, c3, c4 = st.columns(4)
                 c1.metric("Authenticity Index", f"{score}%")
                 c2.metric("Noise Mean", f"{mean_n:.2f}")
                 c3.metric("Std Deviation", f"{std_n:.2f}")
                 c4.metric("Kurtosis", f"{kurt_n:.2f}")
-
+                
+                if score > 85:
+                    st.success("✅ HIGH CONFIDENCE: Document appears authentic")
+                elif score > 60:
+                    st.warning("⚠️ MEDIUM CONFIDENCE: Some anomalies detected")
+                else:
+                    st.error("🚨 LOW CONFIDENCE: Document shows signs of tampering")
+            
+            # --- STEP 5: METADATA ANALYSIS ---
             st.subheader("📋 Step 5: Metadata Analysis")
             with st.expander("EXIF & File Metadata", expanded=True):
                 if 'metadata' not in st.session_state.results:
                     exif = img.getexif()
                     software = exif.get(305) or exif.get(0x0131)
-                    meta = [f"Software: {software}"] if software else ["Metadata: Clean"]
-                    st.session_state.results['metadata'] = meta
+                    metadata_findings = []
+                    
+                    if software:
+                        st.warning(f"⚠️ Metadata Alert: Document edited via **{software}**")
+                        metadata_findings.append(f"Editing Software: {software}")
+                    else:
+                        st.info("✅ Metadata Clean: No editing software headers found.")
+                        metadata_findings.append("Metadata: Clean")
+                    
+                    st.session_state.results['metadata'] = metadata_findings
                 else:
-                    meta = st.session_state.results['metadata']
-                for item in meta: st.write(f"• {item}")
-
+                    metadata_findings = st.session_state.results['metadata']
+            
+            # --- STEP 6: OCR TEXT VERIFICATION ---
             st.subheader("📝 Step 6: OCR Text Verification")
             with st.expander("Optical Character Recognition", expanded=True):
                 if 'ocr_text' not in st.session_state.results:
-                    text_on_doc = extract_text_from_image(img)
-                    st.session_state.results['ocr_text'] = text_on_doc
+                    with st.spinner("Extracting text from image..."):
+                        text_on_doc = extract_text_from_image(img)
+                        st.session_state.results['ocr_text'] = text_on_doc
+                else:
+                    text_on_doc = st.session_state.results['ocr_text']
+                
+                st.write("**Extracted Text Snippet:**")
+                if text_on_doc:
+                    st.code(text_on_doc[:300] + "..." if len(text_on_doc) > 300 else text_on_doc)
+                else:
+                    st.warning("No text detected in image")
+                
+                if 'match_status' not in st.session_state.results:
                     match_status, text_score = cross_reference_text(text_on_doc, owner)
                     st.session_state.results['match_status'] = match_status
                     st.session_state.results['text_score'] = text_score
                 else:
-                    text_on_doc = st.session_state.results['ocr_text']
                     match_status = st.session_state.results['match_status']
-                st.code(text_on_doc[:300])
-                st.write(match_status)
+                    text_score = st.session_state.results['text_score']
+                
+                st.write("**Consistency Check:**")
+                if text_score == 100:
+                    st.success(f"✅ {match_status}")
+                elif text_score == 0 and owner is None:
+                    st.info("ℹ️ No registry match to compare - Document is unregistered")
+                else:
+                    st.error(f"⚠️ {match_status}")
+            
+            
+            
 
+            # --- STEP 8: PDF REPORT ---
             st.divider()
             st.subheader("📄 Step 7: Generate Report")
-            ela_buf = BytesIO()
-            ela_img.save(ela_buf, format="PNG")
-            pdf_data = generate_forensic_report(up_file.name, owner, score, meta, ela_buf.getvalue(), f_bytes)
-            st.download_button("📥 Download Official Report", pdf_data, f"Report_{up_file.name}.pdf", "application/pdf", use_container_width=True)
-
-    elif nav == "Bulk Auditor":
-        show_bulk_auditor(ela_sensitivity)
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                if st.button("🗑️ Clear Analysis", use_container_width=True):
+                    st.session_state.results = {}
+                    st.rerun()
+            
+            with col2:
+                # Prepare and download PDF
+                try:
+                    ela_buf = BytesIO()
+                    ela_img.save(ela_buf, format="PNG")
+                    ela_img_bytes = ela_buf.getvalue()
+                    
+                    pdf_data = generate_forensic_report(
+                        filename=up_file.name,
+                        owner=owner if owner else "Unregistered",
+                        score=score,
+                        metadata=metadata_findings,
+                        ela_img_bytes=ela_img_bytes,
+                        orig_img_bytes=f_bytes
+                    )
+                    
+                    st.download_button(
+                        label="📥 Download Official Report",
+                        data=pdf_data,
+                        file_name=f"Forensic_Report_{up_file.name}.pdf",
+                        mime="application/pdf",
+                        use_container_width=True,
+                        type="primary"
+                    )
+                except Exception as e:
+                    st.error(f"Report generation failed: {e}")
 
     elif nav == "System Settings":
-        st.header("⚙️ Forensic System Management")
-        
-        # --- SECTION 1: AUTHENTICITY BENCHMARKS ---
-        st.subheader("🖼️ Authenticity Reference Library")
-        st.markdown("""
-        Use these reference standards to calibrate your visual analysis. 
-        A **Genuine** document exhibits uniform noise, while **Tampered** documents show localized 'heat' hotspots.
-        """)
-        
-        ref_col1, ref_col2 = st.columns(2)
-        
-        with ref_col1:
-            st.markdown("#### ✅ Genuine Standard")
-            # Example of a clean ELA map
-            st.image("https://raw.githubusercontent.com/everestpipkin/ela-analysis/master/example_images/original_ela.jpg", 
-                     use_container_width=True)
-            st.success("**Visual Signature:** Uniform distribution of dark purple/gray pixels. No specific area 'glows' brighter than the rest.")
+        st.header("⚙️ System Settings")
+        st.write(f"VeriCert Version: {SYSTEM_VERSION}")
+        if st.button("Reset Database Logs"):
+            log_event("Logs cleared by Admin")
+            st.success("Logs reset.")
 
-        with ref_col2:
-            st.markdown("#### 🚨 Tampered Evidence")
-            # Example of a modified ELA map
-            st.image("https://raw.githubusercontent.com/everestpipkin/ela-analysis/master/example_images/modified_ela.jpg", 
-                     use_container_width=True)
-            st.error("**Visual Signature:** High-intensity white/colored clusters. These 'hotspots' indicate where the image was locally edited or resaved.")
-
-        st.divider()
-
-        # --- SECTION 2: SYSTEM HEALTH & STATS ---
-        st.subheader("📊 Diagnostic Overview")
-        stat_c1, stat_c2, stat_c3 = st.columns(3)
-        
-        # Pulling real stats from your SQLite DB
-        conn = sqlite3.connect('vericert_enterprise.db')
-        log_count = pd.read_sql_query("SELECT COUNT(*) FROM logs", conn).iloc[0,0]
-        cert_count = pd.read_sql_query("SELECT COUNT(*) FROM certificates", conn).iloc[0,0]
-        conn.close()
-
-        stat_c1.metric("Database Entries", cert_count)
-        stat_c2.metric("Total Audits Run", log_count)
-        stat_c3.metric("API Latency", "24ms", delta="-2ms")
-
-        # --- SECTION 3: ADMINISTRATIVE CONTROLS ---
-        st.subheader("🛠️ Technical Controls")
-        ctrl_c1, ctrl_c2 = st.columns(2)
-        
-        with ctrl_c1:
-            st.write(f"**Application Version:** `{SYSTEM_VERSION}`")
-            st.write(f"**OCR Engine:** Tesseract v5.0")
-            st.write(f"**Last DB Backup:** {datetime.date.today()}")
-            
-        with ctrl_c2:
-            if st.button("🗑️ Purge Audit Logs", use_container_width=True):
-                log_event("ADMIN: Database logs cleared.")
-                st.warning("All historical logs have been deleted.")
-            
-            if st.button("🔄 Re-initialize Registry", use_container_width=True):
-                init_db()
-                st.toast("Registry Architecture Refreshed")
-
-        st.info("💡 **Developer Note:** Ensure Tesseract-OCR is correctly mapped in your environment variables for Step 6 (OCR) to function in bulk mode.")
-    
-        
-    
 if __name__ == "__main__":
     main()
